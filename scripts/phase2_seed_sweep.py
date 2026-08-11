@@ -35,6 +35,7 @@ import torch
 
 from pi_fsm.cache import get_sprint_segments
 from pi_fsm.pinn.train import TrainConfig, train_pinn
+from pi_fsm.segments import SegmentParams
 
 T_CUTOFF = 2.5  # s: same segment-length restriction that fixed L_data locally
 EARLY_WINDOW = (0.3, 2.0)
@@ -100,15 +101,21 @@ def main() -> None:
     parser.add_argument("--match-id", default="J03WPY")
     parser.add_argument("--seeds", default="0,1,2,3,4")
     parser.add_argument("--out-dir", default="outputs/phase2_pinn/seed_sweep")
+    parser.add_argument(
+        "--v-low", type=float, default=2.0,
+        help="segments.SegmentParams.v_low — raise this (e.g. 6.0) to widen the v0 range "
+        "captured at segment onset, to test whether v0 diversity was limiting identifiability",
+    )
     args = parser.parse_args()
     seeds = [int(s) for s in args.seeds.split(",")]
     out_dir = Path(args.out_dir)
 
-    segs_full = get_sprint_segments(args.match_id)
+    seg_params = SegmentParams(v_low=args.v_low)
+    segs_full = get_sprint_segments(args.match_id, params=seg_params)
     segs = segs_full[segs_full["t"] <= T_CUTOFF].copy()
     v0_max = float(segs["v0"].max())
     print(
-        f"{args.match_id}: {segs['segment_id'].nunique()} segments (t<={T_CUTOFF}s), "
+        f"{args.match_id} (v_low={args.v_low}): {segs['segment_id'].nunique()} segments (t<={T_CUTOFF}s), "
         f"{len(segs)} rows, v0_max={v0_max:.2f}"
     )
     print(f"schedule: {FIXED_SCHEDULE}")
