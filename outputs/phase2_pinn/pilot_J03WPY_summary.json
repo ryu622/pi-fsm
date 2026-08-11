@@ -1,0 +1,13 @@
+{
+  "match_id": "J03WPY",
+  "n_segments": 1332,
+  "n_rows": 103754,
+  "baseline2_final_data_loss": 12.767863273620605,
+  "proposed_final_data_loss": 14.57252025604248,
+  "proposed_final_physics_loss": 0.09177838265895844,
+  "pinn_F_early": 1.0768691301345825,
+  "pinn_k_early": 0.01050580944865942,
+  "pinn_vmax_median": 11.45251750946045,
+  "baseline1_alpha_dt1": 0.9472464302470589,
+  "baseline1_vmax_dt1": 12.340496300571179
+}

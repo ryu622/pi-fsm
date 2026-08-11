@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Cached preprocessed data (regenerate via src/pi_fsm/cache.py)
+data_cache/
+
+# PINN training checkpoints
+checkpoints/
+
+# macOS
+.DS_Store
+
+# Claude Code local session state (not meant to be shared)
+.claude/
