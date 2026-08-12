@@ -14,7 +14,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from pi_fsm.pinn.loss import total_loss
+from pi_fsm.pinn.loss import physics_loss, total_loss
 from pi_fsm.pinn.models import ForceNet, ResistanceNet, TrajectoryNet
 
 
@@ -34,6 +34,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     gamma_final: float = 1.0
     gamma_warmup_epochs: int = 500
+    beta: float = 0.0  # smoothness regularization weight on dF/dt, dk/dt (0 = off)
     n_colloc: int = 2000
     t_max: float = 10.0
     v0_min: float = 0.0
@@ -56,6 +57,7 @@ class TrainResult:
     force_net: ForceNet
     resistance_net: ResistanceNet
     history: pd.DataFrame  # columns: epoch, total, data, physics, gamma
+    stage1_history: pd.DataFrame | None = None  # set only by train_two_stage
 
 
 def _save_checkpoint(path: Path, epoch: int, traj, force, resist, opt) -> None:
@@ -105,10 +107,10 @@ def train_pinn(segments_df: pd.DataFrame, config: TrainConfig | None = None) -> 
         )
 
         opt.zero_grad()
-        loss, l_data, l_phys = total_loss(
+        loss, l_data, l_phys, l_smooth = total_loss(
             traj_net, force_net, resistance_net,
             t_obs, v0_obs, xy_obs, t_colloc, v0_colloc,
-            gamma=gamma, mass=config.mass,
+            gamma=gamma, mass=config.mass, beta=config.beta,
         )
         loss.backward()
         if config.grad_clip:
@@ -123,6 +125,7 @@ def train_pinn(segments_df: pd.DataFrame, config: TrainConfig | None = None) -> 
                     "total": loss.item(),
                     "data": l_data.item(),
                     "physics": l_phys.item(),
+                    "smooth": l_smooth.item(),
                     "gamma": gamma,
                     "lr": scheduler.get_last_lr()[0],
                 }
@@ -139,4 +142,85 @@ def train_pinn(segments_df: pd.DataFrame, config: TrainConfig | None = None) -> 
         force_net=force_net,
         resistance_net=resistance_net,
         history=pd.DataFrame(rows),
+    )
+
+
+def train_two_stage(
+    segments_df: pd.DataFrame,
+    stage1_config: TrainConfig | None = None,
+    stage2_config: TrainConfig | None = None,
+) -> TrainResult:
+    """Two-stage training (see documents/phase2_pilot_results.md "次の一手"):
+
+    Stage 1: fit x_hat(t, v0) on data loss alone (gamma forced to 0).
+    Stage 2: freeze x_hat's weights; fit F(t), k(t) on physics loss alone.
+
+    Motivation: jointly optimizing x_hat and F,k let them co-adapt into a
+    trajectory-consistent but physically degenerate split (seed-to-seed
+    Vmax=F/k CV of 30-45% even with a fixed schedule and wide v0 range —
+    see the Colab seed-sweep results). Freezing x_hat after it has already
+    fit the data well removes that moving target, so F,k only need to
+    explain one fixed trajectory rather than co-adapt with it.
+    """
+    stage1_config = stage1_config or TrainConfig(gamma_final=0.0)
+    stage1 = train_pinn(segments_df, stage1_config)
+
+    stage2_config = stage2_config or TrainConfig(
+        epochs=stage1_config.epochs,
+        lr=stage1_config.lr,
+        lr_min_factor=stage1_config.lr_min_factor,
+        grad_clip=stage1_config.grad_clip,
+        n_colloc=stage1_config.n_colloc,
+        t_max=stage1_config.t_max,
+        v0_min=stage1_config.v0_min,
+        v0_max=stage1_config.v0_max,
+        mass=stage1_config.mass,
+        force_hidden=stage1_config.force_hidden,
+        force_n_hidden=stage1_config.force_n_hidden,
+        device=stage1_config.device,
+        log_every=stage1_config.log_every,
+        seed=stage1_config.seed,
+    )
+    device = stage2_config.device
+
+    traj_net = stage1.traj_net
+    for p in traj_net.parameters():
+        p.requires_grad_(False)
+
+    force_net = ForceNet(hidden=stage2_config.force_hidden, n_hidden=stage2_config.force_n_hidden).to(device)
+    resistance_net = ResistanceNet(
+        hidden=stage2_config.force_hidden, n_hidden=stage2_config.force_n_hidden
+    ).to(device)
+    params = list(force_net.parameters()) + list(resistance_net.parameters())
+    opt = torch.optim.Adam(params, lr=stage2_config.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=stage2_config.epochs, eta_min=stage2_config.lr * stage2_config.lr_min_factor
+    )
+
+    rows = []
+    for epoch in range(stage2_config.epochs):
+        t_colloc = torch.rand(stage2_config.n_colloc, 1, device=device) * stage2_config.t_max
+        v0_colloc = (
+            torch.rand(stage2_config.n_colloc, 1, device=device)
+            * (stage2_config.v0_max - stage2_config.v0_min)
+            + stage2_config.v0_min
+        )
+
+        opt.zero_grad()
+        l_phys = physics_loss(traj_net, force_net, resistance_net, t_colloc, v0_colloc, mass=stage2_config.mass)
+        l_phys.backward()
+        if stage2_config.grad_clip:
+            torch.nn.utils.clip_grad_norm_(params, stage2_config.grad_clip)
+        opt.step()
+        scheduler.step()
+
+        if epoch % stage2_config.log_every == 0 or epoch == stage2_config.epochs - 1:
+            rows.append({"epoch": epoch, "physics": l_phys.item(), "lr": scheduler.get_last_lr()[0]})
+
+    return TrainResult(
+        traj_net=traj_net,
+        force_net=force_net,
+        resistance_net=resistance_net,
+        history=pd.DataFrame(rows),
+        stage1_history=stage1.history,
     )

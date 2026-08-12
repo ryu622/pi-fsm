@@ -69,6 +69,37 @@ def physics_loss(
     return (res_x**2 + res_y**2).mean()
 
 
+def smoothness_loss(
+    force_net: ForceNet,
+    resistance_net: ResistanceNet,
+    t_colloc: torch.Tensor,
+) -> torch.Tensor:
+    """Tikhonov-style regularization: penalizes dF/dt, dk/dt.
+
+    Motivation (documents/phase2_pilot_results.md): the F(t)/k(t) split is
+    an ill-posed inverse problem — many (F,k) pairs fit the trajectory
+    about equally well, so different training runs land on wildly
+    different, equally "valid" splits (seed-to-seed CV of 30-50%+ even
+    with a fixed schedule and wide v0 range). A smoothness prior is the
+    standard remedy for this kind of non-uniqueness: it doesn't add real
+    information, but it picks a canonical, reproducible member of the
+    solution family rather than an arbitrary one.
+
+    Caveat: this biases the recovered F(t),k(t) toward smoothness even in
+    the early window where genuine time-dependence is the object of study.
+    Interpret shape features cautiously — cross-check against Baseline 1's
+    known dt-dependence trend rather than treating any wiggle as discovered
+    physics.
+    """
+    t_colloc = t_colloc.clone().requires_grad_(True)
+    F = force_net(t_colloc)
+    k = resistance_net(t_colloc)
+    grad_out = torch.ones_like(F)
+    dF_dt = torch.autograd.grad(F, t_colloc, grad_out, create_graph=True)[0]
+    dk_dt = torch.autograd.grad(k, t_colloc, grad_out, create_graph=True)[0]
+    return (dF_dt**2).mean() + (dk_dt**2).mean()
+
+
 def total_loss(
     traj_net: TrajectoryNet,
     force_net: ForceNet,
@@ -80,8 +111,15 @@ def total_loss(
     v0_colloc: torch.Tensor,
     gamma: float,
     mass: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (total, data_loss, physics_loss)."""
+    beta: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (total, data_loss, physics_loss, smoothness_loss)."""
     l_data = data_loss(traj_net, t_obs, v0_obs, xy_obs)
     l_phys = physics_loss(traj_net, force_net, resistance_net, t_colloc, v0_colloc, mass)
-    return l_data + gamma * l_phys, l_data, l_phys
+    l_smooth = (
+        smoothness_loss(force_net, resistance_net, t_colloc)
+        if beta > 0
+        else torch.zeros((), device=t_obs.device)
+    )
+    total = l_data + gamma * l_phys + beta * l_smooth
+    return total, l_data, l_phys, l_smooth
