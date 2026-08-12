@@ -35,9 +35,20 @@ def add_velocity(
 
 
 def arrival_points(
-    players_with_velocity: pd.DataFrame, frame_rate: float, delta_t: float
+    players_with_velocity: pd.DataFrame,
+    frame_rate: float,
+    delta_t: float,
+    current_frame_mask: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Arrival points at t+delta_t, in the frame where v(t) points along +x.
+
+    `players_with_velocity` should contain the FULL (unfiltered) frame
+    history, so that t+delta_t lookups work correctly — to restrict which
+    frames count as the "current" time t (e.g. only sprint-onset frames,
+    see segments.sprint_frame_mask), pass `current_frame_mask` (aligned to
+    players_with_velocity's index) rather than pre-filtering the input:
+    pre-filtering breaks the t+delta_t lookup whenever the future frame
+    falls outside the filtered set.
 
     Returns a DataFrame with columns: v0, x_arr, y_arr — one row per
     (player, frame t) pair where both v(t) and the position at t+delta_t
@@ -46,13 +57,18 @@ def arrival_points(
     lag = round(delta_t * frame_rate)
     df = players_with_velocity.sort_values(
         ["player_id", "period_id", "frame_id"]
-    ).reset_index(drop=True)
+    )
+    if current_frame_mask is not None:
+        df = df.assign(_current_frame_mask=current_frame_mask.reindex(df.index))
+    df = df.reset_index(drop=True)
     g = df.groupby(["player_id", "period_id"])
     x_fut = g["x"].shift(-lag)
     y_fut = g["y"].shift(-lag)
     frame_fut = g["frame_id"].shift(-lag)
 
     valid = ((frame_fut - df["frame_id"]) == lag) & df["vx"].notna()
+    if current_frame_mask is not None:
+        valid = valid & df["_current_frame_mask"].fillna(False)
 
     dx = x_fut - df["x"]
     dy = y_fut - df["y"]

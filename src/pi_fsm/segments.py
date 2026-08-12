@@ -157,6 +157,84 @@ def _extract_for_group(
     return rows
 
 
+def _frame_ranges_for_group(
+    frame_id: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    vx: np.ndarray,
+    v0: np.ndarray,
+    frame_rate: float,
+    params: SegmentParams,
+) -> list[tuple[int, int]]:
+    """Same trigger/end logic as _extract_for_group, but returns the raw
+    (start_frame_id, end_frame_id) ranges instead of rotated coordinates.
+    Used to restrict other analyses (e.g. Baseline 1) to sprint-onset frames."""
+    n = len(v0)
+    window = round(params.window_s * frame_rate)
+    min_duration_frames = round(params.min_duration_s * frame_rate)
+    ranges = []
+    i = 0
+    while i < n - window:
+        if np.isnan(v0[i]) or np.isnan(vx[i]) or frame_id[i + window] - frame_id[i] != window:
+            i += 1
+            continue
+        is_start = v0[i] < params.v_low and (v0[i + window] - v0[i]) >= params.delta_v
+        if not is_start:
+            i += 1
+            continue
+
+        end, clean_end = _find_segment_end(v0, frame_id, i, frame_rate, params)
+        if not clean_end:
+            i = end + 1
+            continue
+        if end - i < min_duration_frames:
+            i += 1
+            continue
+        if v0[i : end + 1].max() < params.min_peak_speed:
+            i = end + 1
+            continue
+        frame_speed = np.hypot(np.diff(x[i : end + 1]), np.diff(y[i : end + 1])) / (1.0 / frame_rate)
+        if len(frame_speed) and frame_speed.max() > params.max_frame_speed:
+            i = end + 1
+            continue
+
+        ranges.append((int(frame_id[i]), int(frame_id[end])))
+        i = end + 1
+    return ranges
+
+
+def sprint_frame_mask(
+    players_with_velocity: pd.DataFrame,
+    frame_rate: float,
+    params: SegmentParams | None = None,
+) -> pd.Series:
+    """Boolean mask (aligned to players_with_velocity's index) marking rows
+    that fall within some player's detected sprint segment [start, end].
+
+    Used to restrict Baseline 1's population-wide arrival-circle analysis to
+    the same "accelerating from near rest" context that PINN segments
+    isolate, for an apples-to-apples comparison.
+    """
+    params = params or SegmentParams()
+    mask = pd.Series(False, index=players_with_velocity.index)
+    for (player_id, period_id), g in players_with_velocity.sort_values(
+        ["player_id", "period_id", "frame_id"]
+    ).groupby(["player_id", "period_id"]):
+        ranges = _frame_ranges_for_group(
+            g["frame_id"].to_numpy(),
+            g["x"].to_numpy(),
+            g["y"].to_numpy(),
+            g["vx"].to_numpy(),
+            g["v0"].to_numpy(),
+            frame_rate,
+            params,
+        )
+        for start_fid, end_fid in ranges:
+            in_range = (g["frame_id"] >= start_fid) & (g["frame_id"] <= end_fid)
+            mask.loc[g.index[in_range.to_numpy()]] = True
+    return mask
+
+
 def extract_sprints(
     players_with_velocity: pd.DataFrame,
     frame_rate: float,
