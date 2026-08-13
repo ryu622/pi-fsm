@@ -7,17 +7,25 @@ compare model *predictions at matched time*, not raw parameter values at
 mismatched axes (Baseline 1's delta_t is a prediction horizon averaged over
 the whole match; PINN's t is elapsed time since one sprint's onset -- they
 are not the same axis, so comparing their fitted numbers directly, as
-earlier experiments today did, was a category error).
+earlier experiments did, was a category error).
 
 Ground truth and PINN predictions both use segments.py's own rotation
 convention (net heading over the first second) throughout, avoiding a
 second, different rotation convention (preprocessing.arrival_points' more
 instantaneous-velocity-based one) that would confound the comparison.
 
-Usage: uv run python scripts/phase2_generalization_check.py
+Originally run on J03WPY only (documents/phase2_pilot_results.md); this
+version loops over multiple matches to check whether that result
+replicates -- see notebooks/colab_generalization_check.ipynb for the
+Colab entry point.
+
+Usage: uv run python scripts/phase2_generalization_check.py [--match-ids J03WPY,J03WMX,...] [--out-dir DIR]
 """
 
+import argparse
+import json
 import time
+from pathlib import Path
 
 import matplotlib
 
@@ -27,20 +35,17 @@ import numpy as np
 import pandas as pd
 import torch
 
-from pi_fsm.baseline import A, B
-from pi_fsm.cache import get_sprint_segments
+from pi_fsm.baseline import A, B, estimate_kinetic_parameters
+from pi_fsm.cache import get_players_with_velocity, get_sprint_segments
+from pi_fsm.data import MATCH_IDS
 from pi_fsm.pinn.train import TrainConfig, train_pinn
+from pi_fsm.preprocessing import arrival_points, exclude_goalkeepers
 
-MATCH_ID = "J03WPY"
 T_TRAIN_CUTOFF = 2.5  # PINN is trained only on segment data up to this tau
 EVAL_TAUS = [0.5, 1.0, 1.5, 2.0, 2.5]
 V0_BIN_WIDTH = 0.3
 MIN_BIN_COUNT = 20
-
-# Baseline 1's phase-1 fit at delta_t=1s (documents/phase1_baseline_results.md), used AS-IS
-# (not refit) at every tau below -- this is the "single constant model" being tested.
-ALPHA_BASELINE1 = 0.9472464302470589
-VMAX_BASELINE1 = 12.340496300571179
+BASELINE1_FIT_DT = 1.0  # the single delta_t Baseline1 is calibrated on, per match
 
 
 def bin_ground_truth(segs_full: pd.DataFrame, tau: float, v0_max: float) -> pd.DataFrame:
@@ -57,12 +62,26 @@ def bin_ground_truth(segs_full: pd.DataFrame, tau: float, v0_max: float) -> pd.D
     return g[g["n"] >= MIN_BIN_COUNT].reset_index(drop=True)
 
 
-def main() -> None:
-    segs_full = get_sprint_segments(MATCH_ID)  # full natural duration, default v_low=2.0
+def baseline1_fit(match_id: str) -> tuple[float, float]:
+    """This match's own Baseline1 (alpha, Vmax) at delta_t=1s (full population, not sprint-restricted)."""
+    df, frame_rate = get_players_with_velocity(match_id)
+    df = exclude_goalkeepers(df)
+    ap = arrival_points(df, frame_rate, delta_t=BASELINE1_FIT_DT)
+    res = estimate_kinetic_parameters(ap, delta_t=BASELINE1_FIT_DT)
+    if res is None:
+        raise RuntimeError(f"Baseline1 fit failed for {match_id}")
+    return res.alpha, res.vmax
+
+
+def run_one_match(match_id: str, out_dir: Path) -> pd.DataFrame:
+    segs_full = get_sprint_segments(match_id)  # full natural duration, default v_low=2.0
     segs_train = segs_full[segs_full["t"] <= T_TRAIN_CUTOFF].copy()
     v0_max = float(segs_train["v0"].max())
-    print(f"{MATCH_ID}: {segs_full['segment_id'].nunique()} segments total, "
+    print(f"{match_id}: {segs_full['segment_id'].nunique()} segments total, "
           f"{segs_train['segment_id'].nunique()} used for PINN training (t<={T_TRAIN_CUTOFF}s)")
+
+    alpha1, vmax1 = baseline1_fit(match_id)
+    print(f"{match_id}: Baseline1 (dt={BASELINE1_FIT_DT}s) alpha={alpha1:.3f}, Vmax={vmax1:.3f}")
 
     config = TrainConfig(
         epochs=10000, lr=3e-3, lr_min_factor=0.05, gamma_final=5.0, gamma_warmup_epochs=2000,
@@ -71,14 +90,14 @@ def main() -> None:
     )
     t0 = time.time()
     res = train_pinn(segs_train, config)
-    print(f"trained in {time.time()-t0:.0f}s, L_data={res.history['data'].iloc[-1]:.3f}")
+    print(f"{match_id}: trained in {time.time()-t0:.0f}s, L_data={res.history['data'].iloc[-1]:.3f}")
 
     device = config.device
     rows = []
     for tau in EVAL_TAUS:
         gt = bin_ground_truth(segs_full, tau, v0_max)
         if len(gt) < 3:
-            print(f"tau={tau}: too few bins with data ({len(gt)}), skipping")
+            print(f"{match_id}: tau={tau}: too few bins with data ({len(gt)}), skipping")
             continue
 
         v0_t = torch.tensor(gt["v0"].to_numpy(), dtype=torch.float32, device=device).unsqueeze(-1)
@@ -86,28 +105,67 @@ def main() -> None:
         with torch.no_grad():
             pinn_pred = res.traj_net(t_t, v0_t).cpu().numpy()[:, 0]
 
-        baseline_pred = A(ALPHA_BASELINE1, tau) * gt["v0"].to_numpy() + B(ALPHA_BASELINE1, VMAX_BASELINE1, tau)
+        baseline_pred = A(alpha1, tau) * gt["v0"].to_numpy() + B(alpha1, vmax1, tau)
 
         err_pinn = float(np.sqrt(np.mean((pinn_pred - gt["x"].to_numpy()) ** 2)))
         err_baseline = float(np.sqrt(np.mean((baseline_pred - gt["x"].to_numpy()) ** 2)))
-        rows.append({"tau": tau, "n_bins": len(gt), "rmse_pinn": err_pinn, "rmse_baseline1": err_baseline})
-        print(f"tau={tau}: n_bins={len(gt)}, RMSE PINN={err_pinn:.3f}m, RMSE Baseline1={err_baseline:.3f}m")
+        rows.append({
+            "match_id": match_id, "tau": tau, "n_bins": len(gt),
+            "rmse_pinn": err_pinn, "rmse_baseline1": err_baseline,
+        })
+        print(f"{match_id}: tau={tau}: n_bins={len(gt)}, RMSE PINN={err_pinn:.3f}m, RMSE Baseline1={err_baseline:.3f}m")
 
     result = pd.DataFrame(rows)
-    print()
-    print(result)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result.to_json(out_dir / f"{match_id}.json", orient="records", indent=2)
+    return result
 
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(result["tau"], result["rmse_pinn"], "o-", color="#2a78d6", label="PINN (single time-dependent fit)")
-    ax.plot(result["tau"], result["rmse_baseline1"], "o-", color="#eb6834", label="Baseline1 (single constant fit, dt=1s)")
-    ax.axvline(1.0, color="gray", ls=":", label="Baseline1 was fit here")
-    ax.set_xlabel("tau [s]")
-    ax.set_ylabel("RMSE of predicted center x(tau) [m]")
-    ax.set_title(f"{MATCH_ID}: does a single time-dependent fit generalize across tau better?")
-    ax.legend(fontsize=8)
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--match-ids", default=",".join(MATCH_IDS))
+    parser.add_argument("--out-dir", default="outputs/phase2_pinn/generalization_multi")
+    args = parser.parse_args()
+    match_ids = args.match_ids.split(",")
+    out_dir = Path(args.out_dir)
+
+    done_ids = {p.stem for p in out_dir.glob("*.json")} if out_dir.exists() else set()
+    if done_ids:
+        print(f"already done: {sorted(done_ids)}")
+
+    all_results = []
+    for match_id in match_ids:
+        if match_id in done_ids:
+            all_results.append(pd.read_json(out_dir / f"{match_id}.json"))
+            continue
+        all_results.append(run_one_match(match_id, out_dir))
+
+    combined = pd.concat(all_results, ignore_index=True)
+    combined.to_csv(out_dir / "all_matches_summary.csv", index=False)
+    print(f"\nsaved {out_dir / 'all_matches_summary.csv'}")
+
+    pivot_pinn = combined.pivot(index="tau", columns="match_id", values="rmse_pinn")
+    pivot_baseline = combined.pivot(index="tau", columns="match_id", values="rmse_baseline1")
+    print("\nRMSE PINN:\n", pivot_pinn.round(3))
+    print("\nRMSE Baseline1:\n", pivot_baseline.round(3))
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    cmap = plt.get_cmap("viridis")
+    for i, match_id in enumerate(match_ids):
+        color = cmap(i / max(1, len(match_ids) - 1))
+        sub = combined[combined["match_id"] == match_id].sort_values("tau")
+        axes[0].plot(sub["tau"], sub["rmse_pinn"], "o-", color=color, label=match_id)
+        axes[1].plot(sub["tau"], sub["rmse_baseline1"], "o-", color=color, label=match_id)
+    for ax, title in zip(axes, ["PINN (time-dependent, single fit)", "Baseline1 (constant, single fit at dt=1s)"]):
+        ax.set_xlabel("tau [s]")
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+    axes[0].set_ylabel("RMSE of predicted center x(tau) [m]")
+    fig.suptitle("Generalization across tau: all matches")
     fig.tight_layout()
-    fig.savefig("outputs/phase2_pinn/generalization_check.png", dpi=150, facecolor="white", bbox_inches="tight")
-    print("saved outputs/phase2_pinn/generalization_check.png")
+    fig_path = out_dir / "generalization_multi.png"
+    fig.savefig(fig_path, dpi=150, facecolor="white", bbox_inches="tight")
+    print(f"saved {fig_path}")
 
 
 if __name__ == "__main__":
