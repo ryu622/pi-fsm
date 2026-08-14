@@ -43,9 +43,18 @@ fixed n=(1,0) for a different, simpler purpose, but the underlying
 F(t),k(t) magnitudes are direction-agnostic physical quantities and can
 be reused here).
 
-Usage: uv run python scripts/phase4_synthetic_recovery.py
+This script originally ran on a single match (J03WPY). It now loops over all
+7 idsse-data matches (or a subset via --match-ids), pulling each match's own
+Baseline-1 numbers from outputs/phase1_baseline/all_matches_summary.csv
+instead of hardcoding J03WPY's values, so the two-regime finding can be
+checked for generality rather than trusted from N=1.
+
+Usage:
+  uv run python scripts/phase4_synthetic_recovery.py                     # all 7 matches
+  uv run python scripts/phase4_synthetic_recovery.py --match-ids J03WMX J03WN1
 """
 
+import argparse
 import time
 
 import matplotlib
@@ -60,9 +69,10 @@ from scipy.optimize import brentq
 
 from pi_fsm.baseline import A, KineticParams
 from pi_fsm.cache import get_sprint_segments
+from pi_fsm.data import MATCH_IDS
 from pi_fsm.pinn.train import TrainConfig, train_pinn
 
-DELTA_TS = [0.2, 0.48, 1.0, 2.0, 3.0]  # matches phase 1's *actual* dt values (frame-snapped)
+DELTA_TS = [0.2, 0.48, 1.0, 2.0, 3.0]  # matches phase 1's *actual* dt values (frame-snapped, same for all matches)
 N_SAMPLES = 200_000
 V0_MIN, V0_MAX = 0.05, 8.0
 DT_INTEGRATE = 0.002
@@ -70,13 +80,19 @@ NOISE_SIGMAS = [0.1, 0.3, 0.5, 1.0]  # meters -- sensitivity range, see module d
 NOISE_STD_FOR_T = 0.3  # representative "middle" noise level used for the combined T condition
 DEVICE = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 
-# J03WPY's own Baseline-1 fit at dt=1.0s (outputs/phase1_baseline/summary.json) -- the
-# constant ground truth used for the "constant_*" conditions.
-ALPHA_CONST = 0.9472464302470589
-VMAX_CONST = 12.340496300571179
+BASELINE1_SUMMARY_CSV = "outputs/phase1_baseline/all_matches_summary.csv"
 
-# Real Vmax(delta_t) curve to compare against (outputs/phase1_baseline/summary.json).
-REAL_VMAX = {0.2: 15.582, 0.48: 13.937, 1.0: 12.340, 2.0: 10.535, 3.0: 10.492}
+
+def get_match_baseline_params(match_id: str) -> tuple[float, float, dict[float, float]]:
+    """Per-match constant ground truth (alpha, Vmax at dt=1.0s) and the real
+    Vmax(delta_t) curve to compare against, both from phase 1's results."""
+    df = pd.read_csv(BASELINE1_SUMMARY_CSV)
+    sub = df[df["match_id"] == match_id]
+    const_row = sub[sub["delta_t_nominal"] == 1.0].iloc[0]
+    alpha_const = float(const_row["alpha"])
+    vmax_const = float(const_row["vmax"])
+    real_vmax = {float(row["delta_t_actual"]): float(row["vmax"]) for _, row in sub.iterrows()}
+    return alpha_const, vmax_const, real_vmax
 
 
 def simulate(F_fn, k_fn, noise_std: float, seed: int = 0) -> dict[float, pd.DataFrame]:
@@ -195,9 +211,11 @@ def run_condition(name: str, F_fn, k_fn, noise_std: float) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def main() -> None:
-    print("training PINN on real J03WPY data (t<=2.5s) for the time-varying ground truth...")
-    segs_full = get_sprint_segments("J03WPY")
+def run_for_match(match_id: str, out_dir: str) -> pd.DataFrame:
+    alpha_const, vmax_const, real_vmax = get_match_baseline_params(match_id)
+
+    print(f"training PINN on real {match_id} data (t<=2.5s) for the time-varying ground truth...")
+    segs_full = get_sprint_segments(match_id)
     segs_train = segs_full[segs_full["t"] <= 2.5].copy()
     v0_max_train = float(segs_train["v0"].max())
     config = TrainConfig(
@@ -211,10 +229,10 @@ def main() -> None:
     F_net, k_net = pinn_res.force_net, pinn_res.resistance_net
 
     def F_const(t):
-        return torch.full_like(t, ALPHA_CONST * VMAX_CONST)
+        return torch.full_like(t, alpha_const * vmax_const)
 
     def k_const(t):
-        return torch.full_like(t, ALPHA_CONST)
+        return torch.full_like(t, alpha_const)
 
     results = [run_condition("constant_no_noise", F_const, k_const, noise_std=0.0)]
     for sigma in NOISE_SIGMAS:
@@ -223,7 +241,8 @@ def main() -> None:
     results.append(run_condition("timevarying_noise", F_net, k_net, noise_std=NOISE_STD_FOR_T))
 
     combined = pd.concat(results, ignore_index=True)
-    combined.to_csv("outputs/phase4/synthetic_recovery.csv", index=False)
+    combined.insert(0, "match_id", match_id)
+    combined.to_csv(f"{out_dir}/synthetic_recovery_{match_id}.csv", index=False)
     print("\n", combined.to_string())
 
     fig, ax = plt.subplots(figsize=(9, 5.5))
@@ -240,16 +259,44 @@ def main() -> None:
     sub = combined[combined["condition"] == "timevarying_noise"].sort_values("delta_t")
     ax.plot(sub["delta_t"], sub["vmax"], "o-", color="#2a78d6", lw=2,
             label=f"T: 時間変化+ノイズ(σ={NOISE_STD_FOR_T}m)")
-    real_dt = sorted(REAL_VMAX.keys())
-    ax.plot(real_dt, [REAL_VMAX[d] for d in real_dt], "ks--", lw=2.5, ms=9, label="R: 実データ(J03WPY, フェーズ1)")
+    real_dt = sorted(real_vmax.keys())
+    ax.plot(real_dt, [real_vmax[d] for d in real_dt], "ks--", lw=2.5, ms=9, label=f"R: 実データ({match_id}, フェーズ1)")
     ax.set_xlabel("Δt [s]")
     ax.set_ylabel("$V_{max}$")
     ax.set_ylim(0, 100)
     ax.legend(fontsize=7.5, loc="upper right")
-    ax.set_title("フェーズ4: 実データの不安定性はどちらの指紋に近いか(ノイズ感度分析込み)")
+    ax.set_title(f"フェーズ4 ({match_id}): 実データの不安定性はどちらの指紋に近いか(ノイズ感度分析込み)")
     fig.tight_layout()
-    fig.savefig("outputs/phase4/synthetic_recovery.png", dpi=150, facecolor="white", bbox_inches="tight")
-    print("saved outputs/phase4/synthetic_recovery.png")
+    fig.savefig(f"{out_dir}/synthetic_recovery_{match_id}.png", dpi=150, facecolor="white", bbox_inches="tight")
+    print(f"saved {out_dir}/synthetic_recovery_{match_id}.png")
+    return combined
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--match-ids", nargs="+", default=MATCH_IDS)
+    parser.add_argument("--out-dir", default="outputs/phase4")
+    args = parser.parse_args()
+
+    import os
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    all_results = []
+    agg_path = f"{args.out_dir}/synthetic_recovery_all_matches.csv"
+    for match_id in args.match_ids:
+        csv_path = f"{args.out_dir}/synthetic_recovery_{match_id}.csv"
+        if os.path.exists(csv_path):
+            print(f"\n===== {match_id} (already done, skipping) =====")
+            all_results.append(pd.read_csv(csv_path))
+            continue
+        print(f"\n===== {match_id} =====")
+        combined = run_for_match(match_id, args.out_dir)
+        all_results.append(combined)
+        pd.concat(all_results, ignore_index=True).to_csv(agg_path, index=False)
+        print(f"(incremental save: {agg_path})")
+
+    pd.concat(all_results, ignore_index=True).to_csv(agg_path, index=False)
+    print(f"\nall done. aggregate saved to {agg_path}")
 
 
 if __name__ == "__main__":
